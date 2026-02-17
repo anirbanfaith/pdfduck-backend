@@ -6,10 +6,10 @@ FastAPI backend for PDF data extraction using pdfplumber.
 
 ### 3. configure frontend
 
-paste the railway backend URL into the frontend settings panel:
+paste the backend URL into the frontend settings panel:
 
 ```
-https://blahblahblah.com
+https://backendurl.com
 ```
 
 save and test. if the dot turns green, you're good.
