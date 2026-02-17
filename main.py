@@ -75,6 +75,7 @@ def extract_text_with_structure(pdf_bytes: bytes) -> Dict[str, Any]:
     """
     Extract structured text from PDF when no clear tables exist.
     Attempts to find key-value pairs using common patterns.
+    Falls back to line-by-line extraction for general documents.
     """
     structured_data = {}
     
@@ -83,21 +84,34 @@ def extract_text_with_structure(pdf_bytes: bytes) -> Dict[str, Any]:
         for page in pdf.pages:
             full_text += page.extract_text() or ""
         
-        # Common patterns in shipping bills, invoices, etc.
+        # Common patterns in shipping bills, invoices, resumes, etc.
         patterns = {
             "invoice_number": r"(?:invoice|bill|ref)(?:\s+no\.?|#|number)?:?\s*([A-Z0-9\-/]+)",
             "date": r"(?:date|dated|invoice date|bill date):?\s*(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})",
             "total_amount": r"(?:total|amount|grand total|net amount):?\s*(?:rs\.?|inr|usd|\$)?\s*([\d,]+\.?\d*)",
             "consignee": r"(?:consignee|ship to|deliver to):?\s*([^\n]{5,80})",
             "shipper": r"(?:shipper|exporter|from):?\s*([^\n]{5,80})",
+            "email": r"([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})",
+            "phone": r"(?:phone|mobile|tel|contact)(?:\s*:)?\s*([\d\s\+\-\(\)]{10,20})",
+            "name": r"^([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)",  # First line capitalized name
         }
         
         for field, pattern in patterns.items():
-            match = re.search(pattern, full_text, re.IGNORECASE)
+            match = re.search(pattern, full_text, re.IGNORECASE | re.MULTILINE)
             if match:
                 structured_data[field] = clean_text(match.group(1))
         
-        structured_data["_raw_text_preview"] = full_text[:500]
+        # If very little extracted, do line-by-line split as fallback
+        if len(structured_data) < 2:
+            lines = [clean_text(line) for line in full_text.split('\n') if clean_text(line)]
+            
+            # Extract first 20 meaningful lines as separate fields
+            for idx, line in enumerate(lines[:20], 1):
+                if line and len(line) > 2:
+                    structured_data[f"line_{idx}"] = line
+        
+        structured_data["_full_text"] = full_text
+        structured_data["_text_length"] = len(full_text)
     
     return structured_data
 
@@ -147,19 +161,19 @@ async def extract_pdf(file: UploadFile = File(...)):
         # Fallback to text extraction with pattern matching
         structured = extract_text_with_structure(pdf_bytes)
         
-        if structured and len(structured) > 1:  # more than just preview
+        if structured and len(structured) > 0:  # return anything found, even if minimal
             return JSONResponse({
                 "success": True,
-                "method": "text_pattern_extraction",
+                "method": "text_extraction",
                 "rows": 1,
                 "data": [structured]
             })
         
-        # No structured data found
+        # Truly empty PDF
         return JSONResponse({
             "success": False,
-            "error": "No tables or structured data found in PDF",
-            "suggestion": "PDF may not contain tabular data or standard document fields"
+            "error": "PDF appears to be empty or unreadable",
+            "suggestion": "Check if PDF contains selectable text"
         }, status_code=422)
         
     except Exception as e:
