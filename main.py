@@ -266,10 +266,6 @@ def extract_from_structured_pdf(pdf_bytes: bytes) -> Dict[str, Any]:
         elif 'vessel' in full_text.lower() or 'ship' in full_text.lower():
             data['mode_of_transport'] = 'SEA'
         
-        # Metadata
-        data['_total_pages'] = len(pdf.pages)
-        data['_text_length'] = len(full_text)
-        
         return data
 
 @app.get("/")
