@@ -10,6 +10,7 @@ paste the backend URL into the frontend settings panel:
 
 ```
 https://backendurl.com
+
 ```
 
 save and test. if the dot turns green, you're good.
