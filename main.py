@@ -1,15 +1,18 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-import pdfplumber
+from __future__ import annotations
+
+import asyncio
 import io
 import re
-from typing import Dict, Any, List, Optional
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
+from typing import Any, Dict, List, Optional
 
-app = FastAPI(title="pdfduck API", version="4.0.0")
+import pdfplumber
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
+app = FastAPI(title="pdfduck API", version="5.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,718 +21,309 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+_JUNK = frozenset(["N/A", "NA", "-", "", "None", "null", "NONE"])
 
-def clean(text: str) -> Optional[str]:
-    """Clean text, return None if empty/useless."""
-    if not text:
+
+def clean(text: Any) -> Optional[str]:
+    if text is None:
         return None
-    text = re.sub(r'\s+', ' ', str(text)).strip()
-    return text if text and text not in ['N/A', 'NA', '-', '', 'None', 'null'] else None
+    s = re.sub(r"\s+", " ", str(text)).strip()
+    return s if s and s not in _JUNK else None
 
 
-def parse_date(date_str: str) -> Optional[str]:
-    """Parse any common date format → YYYY-MM-DD."""
-    if not date_str:
-        return None
-    date_str = clean(date_str)
-    if not date_str:
-        return None
-    formats = ['%d/%m/%Y', '%d-%m-%Y', '%d.%m.%Y', '%Y-%m-%d',
-               '%d/%m/%y', '%d-%m-%y', '%d%m%Y']
-    for fmt in formats:
-        try:
-            return datetime.strptime(date_str, fmt).strftime('%Y-%m-%d')
-        except Exception:
-            continue
-    return date_str
+def normalize_key(text: Any) -> str:
+    if text is None:
+        return ""
+    return re.sub(r"[\s:\-/\(\)\[\]\.]+", "", str(text)).lower()
 
 
-def to_decimal(val: str) -> Optional[str]:
-    """Extract clean decimal number from string."""
+def is_data_value(val: str) -> bool:
     if not val:
+        return False
+    s = val.strip()
+    if s.endswith(":"):
+        return False
+    nospace = re.sub(r"\s+", "", s)
+    if len(nospace) > 15 and nospace == nospace.upper() and re.match(r"^[A-Z]+$", nospace):
+        return False
+    return True
+
+
+def parse_date(raw: str) -> Optional[str]:
+    s = clean(raw)
+    if not s:
+        return None
+    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%Y-%m-%d",
+                "%d/%m/%y", "%d-%m-%y", "%d%m%Y"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    return s
+
+
+def to_decimal(raw: str) -> Optional[str]:
+    if not raw:
+        return None
+    m = re.search(r"[\d,]+\.?\d*", str(raw))
+    if not m:
         return None
     try:
-        cleaned = re.sub(r'[^\d.]', '', str(val))
-        if cleaned and cleaned not in ['.', '']:
-            return str(Decimal(cleaned))
-    except Exception:
-        pass
-    return None
+        return str(Decimal(m.group().replace(",", "")))
+    except InvalidOperation:
+        return None
 
 
-# ---------------------------------------------------------------------------
-# Extraction engine
-# ---------------------------------------------------------------------------
+def first_int(s: str) -> Optional[str]:
+    m = re.search(r"\d+", str(s))
+    return m.group() if m else None
+
 
 class ExtractionEngine:
-    """
-    Exhaustive multi-method field extractor for CSB-V and similar structured PDFs.
-
-    Table layout note:
-        CSB-V renders rows like:
-            [key1 | value1 | key2 | value2]
-        so we index ALL even columns as keys and the following odd column as value.
-    """
-
-    def __init__(self, pdf):
-        self.pdf = pdf
-        self.full_text = ""
+    def __init__(self, pdf: pdfplumber.PDF) -> None:
+        self.full_text: str = ""
         self.tables: List[List[List[Optional[str]]]] = []
 
         for page in pdf.pages:
-            text = page.extract_text()
-            if text:
-                self.full_text += text + "\n"
+            self.full_text += (page.extract_text() or "") + "\n"
+            for tbl in page.extract_tables() or []:
+                self.tables.append(tbl)
 
-            page_tables = page.extract_tables()
-            if page_tables:
-                self.tables.extend(page_tables)
+        self._kv: Dict[str, str] = {}
+        self._build_kv_index()
 
-        self.data: Dict[str, Any] = {}
-
-    # ------------------------------------------------------------------
-    # Low-level search helpers
-    # ------------------------------------------------------------------
-
-    def find_in_tables(self, key_patterns: List[str],
-                       value_col_offset: int = 1) -> Optional[str]:
-        """
-        Search every table row.
-        Checks ALL even-indexed columns as potential keys (col 0, 2, 4…)
-        so that multi-column CSB-V rows are handled correctly.
-        """
+    def _build_kv_index(self) -> None:
         for table in self.tables:
             if not table:
                 continue
-            for row in table:
+            n_rows = len(table)
+
+            for r_idx, row in enumerate(table):
                 if not row:
                     continue
-                # Try each even column as a key cell
-                for key_col in range(0, len(row), 2):
-                    val_col = key_col + value_col_offset
-                    if val_col >= len(row):
-                        continue
+                n_cols = len(row)
 
-                    key_text = clean(str(row[key_col])) if row[key_col] else ""
-                    if not key_text:
-                        continue
+                # Strategy C (highest priority): header row + next data row
+                if r_idx + 1 < n_rows:
+                    next_row = table[r_idx + 1]
+                    if next_row:
+                        for col, cell in enumerate(row):
+                            hdr = normalize_key(cell)
+                            if not hdr or len(hdr) < 2:
+                                continue
+                            if col < len(next_row):
+                                val = clean(next_row[col])
+                                if val and is_data_value(val):
+                                    self._kv[hdr] = val
 
-                    for pattern in key_patterns:
-                        if re.search(pattern, key_text, re.IGNORECASE):
-                            val = clean(str(row[val_col])) if row[val_col] else None
-                            if val:
-                                return val
+                # Strategy A+B: same-row key-value at offset 1 or 2
+                for k_col in range(n_cols):
+                    raw_key = normalize_key(row[k_col])
+                    if len(raw_key) < 2:
+                        continue
+                    for offset in (1, 2):
+                        v_col = k_col + offset
+                        if v_col < n_cols:
+                            val = clean(row[v_col])
+                            if val and is_data_value(val) and raw_key not in self._kv:
+                                self._kv[raw_key] = val
+                                break
+
+    def _lookup(self, *key_variants: str) -> Optional[str]:
+        for variant in key_variants:
+            if variant.startswith("re:"):
+                for k, v in self._kv.items():
+                    if re.search(variant[3:], k, re.IGNORECASE):
+                        return v
+            else:
+                nk = normalize_key(variant)
+                if nk in self._kv:
+                    return self._kv[nk]
         return None
 
-    def find_in_text(self, patterns: List[str], group: int = 1) -> Optional[str]:
-        """Search full concatenated text with regex patterns."""
+    def _text(self, *patterns: str) -> Optional[str]:
         for pattern in patterns:
-            match = re.search(pattern, self.full_text, re.IGNORECASE | re.MULTILINE)
-            if match:
+            m = re.search(pattern, self.full_text, re.IGNORECASE | re.MULTILINE)
+            if m:
                 try:
-                    val = clean(match.group(group))
+                    val = clean(m.group(1))
                     if val:
                         return val
                 except IndexError:
-                    continue
+                    pass
         return None
 
-    def find_all_in_text(self, patterns: List[str]) -> List[str]:
-        """Return all unique matches for given patterns."""
-        results: List[str] = []
+    def _text_all(self, *patterns: str) -> List[str]:
+        seen: Dict[str, None] = {}
         for pattern in patterns:
-            matches = re.findall(pattern, self.full_text, re.IGNORECASE)
-            for m in matches:
+            for m in re.findall(pattern, self.full_text, re.IGNORECASE):
                 val = clean(m if isinstance(m, str) else m[0])
-                if val and val not in results:
-                    results.append(val)
-        return results
+                if val:
+                    seen[val] = None
+        return list(seen)
 
-    def extract_field(self, field_name: str,
-                      table_keys: List[str],
-                      text_patterns: List[str],
-                      processor=None) -> Optional[str]:
-        """Try tables first, then regex on full text; optionally post-process."""
-        val = self.find_in_tables(table_keys)
-        if not val:
-            val = self.find_in_text(text_patterns)
-        if val and processor:
-            val = processor(val)
+    def _get(self, *key_variants: str, tp: Optional[List[str]] = None, fn=None) -> Optional[str]:
+        val = self._lookup(*key_variants)
+        if not val and tp:
+            val = self._text(*tp)
+        if val and fn:
+            val = fn(val)
         return val
 
-    # ------------------------------------------------------------------
-    # Main extraction
-    # ------------------------------------------------------------------
-
     def extract(self) -> Dict[str, Any]:
+        d: Dict[str, Any] = {}
 
-        # ── SHIPPING BILL (CSB) NUMBER ──────────────────────────────────
-        # Keep the FULL CSB number (e.g. CSBV_DEL_2024-2025_2012_16454)
-        csb_raw = self.find_in_tables([r'CSB\s*Number', r'Shipping\s*Bill\s*No'])
-        if not csb_raw:
-            csb_raw = self.find_in_text([
-                r'CSB\s*Number\s*[:\|]?\s*([A-Z0-9_\-/\s]+)',
-                r'CSBV[_\-][A-Z0-9_\-]+',
-            ])
-        if csb_raw:
-            # Normalise internal whitespace but keep full alphanumeric structure
-            self.data['shipping_bill_no'] = re.sub(r'\s+', '', csb_raw)
+        csb = self._lookup("CSBNumber", "CSB Number")
+        if not csb:
+            csb = self._text(r"CSB\s*Number\s*[:\|]?\s*([A-Z0-9_\-/\s]+?)(?=\s+Filling|\s*\n)")
+        if csb:
+            d["shipping_bill_no"] = re.sub(r"\s+", "", csb)
 
-        # ── DATES ───────────────────────────────────────────────────────
-        self.data['filling_date'] = self.extract_field(
-            'filling_date',
-            [r'Fill(?:ing)?\s*Date', r'SB\s*Date', r'Bill\s*Date'],
-            [
-                r'Fill(?:ing)?\s*Date\s*[:\|]?\s*([\d/\-\.]+)',
-                r'SB\s*Date\s*[:\|]?\s*([\d/\-\.]+)',
-            ],
-            processor=parse_date
-        )
+        d["filling_date"] = self._get("FillingDate", "Filling Date", tp=[r"Fill(?:ing)?\s*Date\s*[:\|]?\s*([\d/\-\.]+)"], fn=parse_date)
+        d["date_of_departure"] = self._get("DateofDeparture", "Date of Departure", tp=[r"Date\s*of\s*Departure\s*[:\|]?\s*([\d/\-\.]+)"], fn=parse_date)
+        d["egm_date"] = self._get("EGMDate", "EGM Date", tp=[r"EGM\s*Date\s*[:\|]?\s*([\d/\-\.]+)"], fn=parse_date)
+        d["leo_date"] = self._get("LEODATE", "LEO DATE", tp=[r"LEO\s*DATE?\s*[:\|]?\s*([\d/\-\.]+)"], fn=parse_date)
 
-        self.data['invoice_date'] = self.extract_field(
-            'invoice_date',
-            [r'Invoice\s*Date'],
-            [r'Invoice\s*Date\s*[:\|]?\s*([\d/\-\.]+)'],
-            processor=parse_date
-        )
+        inv = self._lookup("InvoiceNumber", "Invoice Number", "InvoiceNo", "Invoice No")
+        if inv and re.fullmatch(r"[\d/\-\.]+", inv):
+            inv = None
+        if inv and re.search(r"(invoicedate|invoicevalue|date|value)", inv, re.IGNORECASE):
+            inv = None
+        if not inv:
+            inv = self._text(
+                r"InvoiceNumber:\s*\n?\s*([A-Za-z][A-Za-z0-9/\-]{3,20})",
+                r"Invoice\s*(?:Number|No\.?)\s*[:\|]?\s*([A-Za-z][A-Za-z0-9/\-]{3,20})",
+            )
+        if not inv:
+            candidates = self._text_all(r"\b([A-Za-z]{2,8}[-/]\d{6,12})\b")
+            inv = candidates[0] if candidates else None
+        d["invoice_number"] = inv
 
-        self.data['date_of_departure'] = self.extract_field(
-            'date_of_departure',
-            [r'Date\s*of\s*Departure'],
-            [r'Date\s*of\s*Departure\s*[:\|]?\s*([\d/\-\.]+)'],
-            processor=parse_date
-        )
+        d["invoice_date"] = self._get("InvoiceDate", "Invoice Date", tp=[r"Invoice\s*Date\s*[:\|]?\s*([\d/\-\.]+)"], fn=parse_date)
+        d["invoice_value_inr"] = self._get("InvoiceValue(inINR)", "Invoice Value (in INR)", "re:invoicevalue.*inr", tp=[r"Invoice\s*Value\s*\(?in\s*INR\)?\s*[:\|]?\s*([\d,\.]+)"], fn=to_decimal)
+        d["hawb_number"] = self._get("HAWBNumber", "HAWB Number", tp=[r"HAWB\s*Number\s*[:\|]?\s*(\d{8,15})"])
+        d["fob_value_inr"] = self._get("FOBValue(InINR)", "FOB Value (In INR)", "re:fobvalue.*inr", tp=[r"FOB\s*Value\s*\(?In\s*INR\)?\s*[:\|]?\s*([\d,\.]+)"], fn=to_decimal)
+        d["fob_value_fc"] = self._get("FOBValue(InForeignCurrency)", "re:fobvalue.*foreigncur", tp=[r"FOB\s*Value\s*\(?In\s*Foreign[^:]*\)?\s*[:\|]?\s*([\d,\.]+)"], fn=to_decimal)
 
-        self.data['egm_date'] = self.extract_field(
-            'egm_date',
-            [r'EGM\s*Date'],
-            [r'EGM\s*Date\s*[:\|]?\s*([\d/\-\.]+)'],
-            processor=parse_date
-        )
+        raw_curr = self._get("FOBCurrency(InForeignCurrency)", "re:fobcurrency", tp=[r"FOB\s*Currency[^:]*[:\|]?\s*([A-Z]{3})"])
+        d["fob_currency"] = raw_curr[:3].upper() if raw_curr else None
 
-        leo_raw = self.extract_field(
-            'leo_date',
-            [r'LEO\s*DATE', r'LEO\s*Date'],
-            [r'LEO\s*DATE?\s*[:\|]?\s*([\d/\-\.]+)'],
-            processor=parse_date
-        )
-        self.data['leo_date'] = leo_raw
+        d["fob_exchange_rate"] = self._get("FOBExchangeRate(InForeignCurrency)", "re:fobexchangerate", tp=[r"FOB\s*Exchange\s*Rate[^:]*[:\|]?\s*([\d\.]+)"], fn=to_decimal)
+        d["unit_price"] = self._get("UnitPrice", "Unit Price", tp=[r"Unit\s*Price\s*[:\|]?\s*([\d,\.]+)"], fn=to_decimal)
 
-        # ── INVOICE NUMBER (critical) ────────────────────────────────────
-        invoice = self.extract_field(
-            'invoice_number',
-            [r'Invoice\s*Number', r'Invoice\s*No\.?'],
-            [
-                r'Invoice\s*(?:Number|No\.?)\s*[:\|]?\s*([A-Za-z0-9\-/]+)',
-                r'Inv\.?\s*(?:No\.?|#)\s*[:\|]?\s*([A-Za-z0-9\-/]+)',
-            ]
-        )
-        if not invoice:
-            # Pattern: 2–8 alpha chars followed by hyphen + 6–12 digits/alphanums
-            candidates = self.find_all_in_text([r'\b([A-Za-z]{2,8}[-/]\d{6,12})\b'])
-            if candidates:
-                invoice = candidates[0]
-        self.data['invoice_number'] = invoice
+        raw_upc = self._get("UnitPriceCurrency", "Unit Price Currency", tp=[r"Unit\s*Price\s*Currency\s*[:\|]?\s*([A-Z]{3})"])
+        d["unit_price_currency"] = raw_upc[:3].upper() if raw_upc else None
 
-        # ── TRACKING / HAWB ─────────────────────────────────────────────
-        self.data['hawb_number'] = self.extract_field(
-            'hawb_number',
-            [r'HAWB\s*Number', r'AWB\s*Number'],
-            [
-                r'HAWB\s*Number\s*[:\|]?\s*(\d{8,15})',
-                r'AWB\s*(?:No\.?|Number)\s*[:\|]?\s*([A-Z0-9]+)',
-            ]
-        )
+        d["total_item_value"] = self._get("TotalItemValue", "Total Item Value", tp=[r"Total\s*Item\s*Value\b(?!\s*\(In)\s*[:\|]?\s*([\d,\.]+)"], fn=to_decimal)
+        d["total_item_value_inr"] = self._get("TotalItemValue(InINR)", "re:totalitemvalue.*inr", tp=[r"Total\s*Item\s*Value\s*\(?In\s*INR\)?\s*[:\|]?\s*([\d,\.]+)"], fn=to_decimal)
+        d["total_taxable_value"] = self._get("TotalTaxableValue", "Total Taxable Value", tp=[r"Total\s*Taxable\s*Value\s*[:\|]?\s*([\d,\.]+)"], fn=to_decimal)
+        d["total_igst_paid"] = self._get("TotalIGSTPaid", "Total IGST Paid", tp=[r"Total\s*IGST\s*Paid\s*[:\|]?\s*([\d,\.]+)"], fn=to_decimal)
+        d["total_cess_paid"] = self._get("TotalCESSPaid", "Total CESS Paid", tp=[r"Total\s*CESS\s*Paid\s*[:\|]?\s*([\d,\.]+)"], fn=to_decimal)
+        d["exchange_rate"] = self._get("ExchangeRate", "Exchange Rate", tp=[r"\bExchange\s*Rate\s*[:\|]?\s*([\d\.]+)"], fn=to_decimal)
+        d["exporter_name"] = self._get("NameoftheConsignor", "Name of the Consignor", tp=[r"Name\s*of\s*(?:the\s*)?Consignor\s*[:\|]?\s*([^\n]{5,150})"])
+        d["exporter_address"] = self._get("AddressoftheConsignor", "Address of the Consignor", tp=[r"Address\s*of\s*(?:the\s*)?Consignor\s*[:\|]?\s*([^\n]{10,300})"])
+        d["consignee_name"] = self._get("NameoftheConsignee", "Name of the Consignee", tp=[r"Name\s*of\s*(?:the\s*)?Consignee\s*[:\|]?\s*([^\n]{2,150})"])
 
-        # ── FINANCIAL ───────────────────────────────────────────────────
-        # FOB Value (INR)
-        fob = self.extract_field(
-            'fob_value_inr',
-            [r'FOB\s*Value.*INR', r'FOB\s*Value\s*\(In\s*INR\)'],
-            [
-                r'FOB\s*Value\s*\(?In\s*INR\)?\s*[:\|]?\s*([\d,\.]+)',
-                r'FOB\s*Value\s*[:\|]?\s*([\d,\.]+)',
-            ],
-            processor=to_decimal
-        )
-        self.data['fob_value_inr'] = fob
+        ca = self._get("AddressoftheConsignee", "Address of the Consignee", tp=[r"Address\s*of\s*(?:the\s*)?Consignee\s*[:\|]?\s*([^\n]{10,300})"])
+        if ca and not re.search(r"[\d,]", ca):
+            ca = self._text(r"Address\s*of\s*(?:the\s*)?Consignee\s*[:\|]?\s*([^\n]{10,300})")
+        d["consignee_address"] = ca
 
-        # FOB Value (Foreign Currency)
-        fob_fc = self.extract_field(
-            'fob_value_fc',
-            [r'FOB\s*Value.*Foreign\s*Cur', r'FOB\s*Value\s*\(In\s*Foreign'],
-            [r'FOB\s*Value\s*\(?In\s*Foreign\s*Cur[^:]*\)?\s*[:\|]?\s*([\d,\.]+)'],
-            processor=to_decimal
-        )
-        self.data['fob_value_fc'] = fob_fc
-
-        # FOB Currency
-        currency = self.extract_field(
-            'fob_currency',
-            [r'FOB\s*Currency'],
-            [
-                r'FOB\s*Currency\s*[:\|]?\s*([A-Z]{3})',
-                r'\b(USD|INR|EUR|GBP|AED|SGD|CNY|JPY|AUD)\b',
-            ]
-        )
-        if currency:
-            self.data['fob_currency'] = currency[:3].upper()
-
-        # FOB Exchange Rate
-        self.data['fob_exchange_rate'] = self.extract_field(
-            'fob_exchange_rate',
-            [r'FOB\s*Exchange\s*Rate'],
-            [r'FOB\s*Exchange\s*Rate[^:]*[:\|]?\s*([\d\.]+)'],
-            processor=to_decimal
-        )
-
-        # Invoice Value
-        self.data['invoice_value_inr'] = self.extract_field(
-            'invoice_value_inr',
-            [r'Invoice\s*Value.*INR', r'Invoice\s*Value\s*\(in\s*INR\)'],
-            [
-                r'Invoice\s*Value\s*\(?in\s*INR\)?\s*[:\|]?\s*([\d,\.]+)',
-                r'Invoice\s*Value\s*[:\|]?\s*([\d,\.]+)',
-            ],
-            processor=to_decimal
-        )
-
-        # Unit Price
-        self.data['unit_price'] = self.extract_field(
-            'unit_price',
-            [r'Unit\s*Price'],
-            [r'Unit\s*Price\s*[:\|]?\s*([\d,\.]+)'],
-            processor=to_decimal
-        )
-
-        # Unit Price Currency
-        upc = self.extract_field(
-            'unit_price_currency',
-            [r'Unit\s*Price\s*Currency'],
-            [r'Unit\s*Price\s*Currency\s*[:\|]?\s*([A-Z]{3})']
-        )
-        if upc:
-            self.data['unit_price_currency'] = upc[:3].upper()
-
-        # Total Item Value
-        self.data['total_item_value'] = self.extract_field(
-            'total_item_value',
-            [r'Total\s*Item\s*Value'],
-            [r'Total\s*Item\s*Value\s*[:\|]?\s*([\d,\.]+)'],
-            processor=to_decimal
-        )
-
-        # Total Item Value (INR)
-        self.data['total_item_value_inr'] = self.extract_field(
-            'total_item_value_inr',
-            [r'Total\s*Item\s*Value\s*\(?In\s*INR\)?'],
-            [r'Total\s*Item\s*Value\s*\(?In\s*INR\)?\s*[:\|]?\s*([\d,\.]+)'],
-            processor=to_decimal
-        )
-
-        # Total Taxable Value
-        self.data['total_taxable_value'] = self.extract_field(
-            'total_taxable_value',
-            [r'Total\s*Taxable\s*Value'],
-            [r'Total\s*Taxable\s*Value\s*[:\|]?\s*([\d,\.]+)'],
-            processor=to_decimal
-        )
-
-        # Total IGST Paid
-        self.data['total_igst_paid'] = self.extract_field(
-            'total_igst_paid',
-            [r'Total\s*IGST\s*Paid'],
-            [r'Total\s*IGST\s*Paid\s*[:\|]?\s*([\d,\.]+)'],
-            processor=to_decimal
-        )
-
-        # Total CESS Paid
-        self.data['total_cess_paid'] = self.extract_field(
-            'total_cess_paid',
-            [r'Total\s*CESS\s*Paid'],
-            [r'Total\s*CESS\s*Paid\s*[:\|]?\s*([\d,\.]+)'],
-            processor=to_decimal
-        )
-
-        # Exchange Rate (item level)
-        self.data['exchange_rate'] = self.extract_field(
-            'exchange_rate',
-            [r'^Exchange\s*Rate$'],
-            [r'Exchange\s*Rate\s*[:\|]?\s*([\d\.]+)'],
-            processor=to_decimal
-        )
-
-        # ── PARTIES ─────────────────────────────────────────────────────
-        self.data['exporter_name'] = self.extract_field(
-            'exporter_name',
-            [r'Name\s*of\s*(?:the\s*)?Consignor', r'Exporter', r'Shipper'],
-            [
-                r'Name\s*of\s*(?:the\s*)?Consignor\s*[:\|]?\s*([^\n]{5,150})',
-                r'Exporter\s*(?:Name)?\s*[:\|]?\s*([^\n]{5,150})',
-            ]
-        )
-
-        self.data['exporter_address'] = self.extract_field(
-            'exporter_address',
-            [r'Address\s*of\s*(?:the\s*)?Consignor'],
-            [r'Address\s*of\s*(?:the\s*)?Consignor\s*[:\|]?\s*([^\n]{10,300})']
-        )
-
-        self.data['consignee_name'] = self.extract_field(
-            'consignee_name',
-            [r'Name\s*of\s*(?:the\s*)?Consignee', r'Buyer', r'Importer'],
-            [
-                r'Name\s*of\s*(?:the\s*)?Consignee\s*[:\|]?\s*([^\n]{2,150})',
-                r'Consignee\s*[:\|]?\s*([^\n]{2,150})',
-            ]
-        )
-
-        consignee_addr = self.extract_field(
-            'consignee_address',
-            [r'Address\s*of\s*(?:the\s*)?Consignee'],
-            [r'Address\s*of\s*(?:the\s*)?Consignee\s*[:\|]?\s*([^\n]{10,300})']
-        )
-        self.data['consignee_address'] = consignee_addr
-
-        # ── COUNTRY (from address or dedicated field) ────────────────────
         country = None
-        if consignee_addr:
-            addr_upper = consignee_addr.upper()
-            country_map = {
-                'AUSTRALIA': 'Australia',
-                'UNITED STATES': 'United States',
-                'USA': 'United States',
-                'CANADA': 'Canada',
-                'UNITED KINGDOM': 'United Kingdom',
-                'UK': 'United Kingdom',
-                'SINGAPORE': 'Singapore',
-                'UAE': 'UAE',
-                'GERMANY': 'Germany',
-                'FRANCE': 'France',
-                'CHINA': 'China',
-                'JAPAN': 'Japan',
-                'HONG KONG': 'Hong Kong',
-                'THAILAND': 'Thailand',
-                'MALAYSIA': 'Malaysia',
-                'NETHERLANDS': 'Netherlands',
-                'BELGIUM': 'Belgium',
-                'ITALY': 'Italy',
-                'SPAIN': 'Spain',
-                'NEW ZEALAND': 'New Zealand',
-                'SOUTH AFRICA': 'South Africa',
-            }
-            for keyword, name in country_map.items():
-                if keyword in addr_upper:
+        if ca:
+            for kw, name in [
+                ("AUSTRALIA", "Australia"), ("NEW ZEALAND", "New Zealand"),
+                ("UNITED STATES", "United States"), ("USA", "United States"),
+                ("CANADA", "Canada"), ("UNITED KINGDOM", "United Kingdom"),
+                ("UK", "United Kingdom"), ("SINGAPORE", "Singapore"),
+                ("UAE", "UAE"), ("GERMANY", "Germany"), ("FRANCE", "France"),
+                ("CHINA", "China"), ("JAPAN", "Japan"), ("HONG KONG", "Hong Kong"),
+                ("THAILAND", "Thailand"), ("MALAYSIA", "Malaysia"),
+                ("NETHERLANDS", "Netherlands"), ("BELGIUM", "Belgium"),
+                ("ITALY", "Italy"), ("SPAIN", "Spain"), ("SOUTH AFRICA", "South Africa"),
+            ]:
+                if kw in ca.upper():
                     country = name
                     break
-        if not country:
-            country = self.extract_field(
-                'consignee_country',
-                [r'Country', r'Destination\s*Country'],
-                [
-                    r'Country\s*(?:of\s*Destination)?\s*[:\|]?\s*([A-Za-z\s]+)',
-                    r'Destination\s*[:\|]?\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)',
-                ]
-            )
-        self.data['consignee_country'] = country
+        d["consignee_country"] = country
 
-        # ── PORTS ───────────────────────────────────────────────────────
-        self.data['port_of_loading'] = self.extract_field(
-            'port_of_loading',
-            [r'Port\s*of\s*Loading', r'POL'],
-            [
-                r'Port\s*of\s*Loading\s*[:\|]?\s*([A-Z0-9\s]{2,30})',
-                r'POL\s*[:\|]?\s*([A-Z0-9]{2,10})',
-            ]
-        )
+        d["port_of_loading"] = self._get("PortofLoading", "Port of Loading", tp=[r"Port\s*of\s*Loading\s*[:\|]?\s*([A-Z0-9]{2,10})"])
+        d["port_of_discharge"] = self._get("AirportofDestination", "Airport of Destination", "PortofDischarge", "Port of Discharge", tp=[r"Airport\s*of\s*Destination\s*[:\|]?\s*([A-Z0-9]{2,10})"])
+        d["custom_station"] = self._get("CustomStationName", "Custom Station Name", tp=[r"Custom\s*Station\s*Name\s*[:\|]?\s*([A-Z0-9]{2,10})"])
 
-        self.data['port_of_discharge'] = self.extract_field(
-            'port_of_discharge',
-            [r'Airport\s*of\s*Destination', r'Port\s*of\s*Discharge', r'POD'],
-            [
-                r'Airport\s*of\s*Destination\s*[:\|]?\s*([A-Z0-9]{2,10})',
-                r'Port\s*of\s*Discharge\s*[:\|]?\s*([A-Z0-9\s]{2,30})',
-            ]
-        )
+        pkgs = self._get("NumberofPackagesPiecesBagsULD", "re:numberofpackages", tp=[r"Number\s*of\s*Packages[^:]*[:\|]?\s*(\d+)"])
+        d["total_packages"] = first_int(pkgs) if pkgs else None
 
-        self.data['custom_station'] = self.extract_field(
-            'custom_station',
-            [r'Custom\s*Station\s*Name'],
-            [r'Custom\s*Station\s*Name\s*[:\|]?\s*([A-Z0-9]{2,10})']
-        )
+        qty = self._get("Quantity", tp=[r"\bQuantity\s*[:\|]?\s*(\d+)"])
+        d["quantity"] = first_int(qty) if qty else None
 
-        # ── CARGO ───────────────────────────────────────────────────────
-        packages = self.extract_field(
-            'total_packages',
-            [r'Number\s*of\s*Packages', r'No\.?\s*of\s*Packages'],
-            [
-                r'Number\s*of\s*Packages[^:]*[:\|]?\s*(\d+)',
-                r'(?:No\.?\s*of\s*)?Packages\s*[:\|]?\s*(\d+)',
-            ]
-        )
-        if packages:
-            m = re.search(r'(\d+)', packages)
-            packages = m.group(1) if m else packages
-        self.data['total_packages'] = packages
+        d["unit_of_measure"] = self._get("UnitOfMeasure", "Unit Of Measure", tp=[r"Unit\s*Of\s*Measure\s*[:\|]?\s*([A-Z]{2,10})"])
+        d["gross_weight"] = self._get("DeclaredWeight(inKgs)", "Declared Weight(in Kgs)", tp=[r"Declared\s*Weight[^:]*[:\|]?\s*([\d\.]+)"])
 
-        qty = self.extract_field(
-            'quantity',
-            [r'^Quantity$'],
-            [r'\bQuantity\s*[:\|]?\s*(\d+)\b']
-        )
-        if qty:
-            m = re.search(r'(\d+)', qty)
-            qty = m.group(1) if m else qty
-        self.data['quantity'] = qty
-
-        self.data['unit_of_measure'] = self.extract_field(
-            'unit_of_measure',
-            [r'Unit\s*Of\s*Measure', r'UOM'],
-            [r'Unit\s*Of\s*Measure\s*[:\|]?\s*([A-Z]{2,10})']
-        )
-
-        self.data['gross_weight'] = self.extract_field(
-            'gross_weight',
-            [r'Declared\s*Weight', r'Gross\s*Weight'],
-            [
-                r'Declared\s*Weight[^:]*[:\|]?\s*([\d\.]+)',
-                r'Gross\s*Weight\s*[:\|]?\s*([\d\.]+)',
-            ]
-        )
-
-        # ── HS CODE ─────────────────────────────────────────────────────
-        hs = self.extract_field(
-            'hs_code',
-            [r'CTSH', r'HS\s*Code', r'Tariff'],
-            [
-                r'CTSH\s*[:\|]?\s*(\d{4,10})',
-                r'HS\s*Code\s*[:\|]?\s*(\d{4,10})',
-                r'Tariff\s*[:\|]?\s*(\d{4,10})',
-            ]
-        )
+        hs = self._get("CTSH", tp=[r"CTSH\s*[:\|]?\s*(\d{4,10})"])
         if hs:
-            m = re.search(r'(\d{4,10})', hs)
+            m = re.search(r"(\d{4,10})", hs)
             hs = m.group(1) if m else hs
-        self.data['hs_code'] = hs
+        d["hs_code"] = hs
 
-        # ── ITEM DESCRIPTION / SKU ───────────────────────────────────────
-        self.data['item_description'] = self.extract_field(
-            'item_description',
-            [r'Goods\s*Description', r'Description\s*of\s*Goods'],
-            [
-                r'Goods\s*Description\s*[:\|]?\s*([^\n]{3,200})',
-                r'Description\s*of\s*Goods\s*[:\|]?\s*([^\n]{3,200})',
-            ]
-        )
+        d["item_description"] = self._get("GoodsDescription", "Goods Description", tp=[r"Goods\s*Description\s*[:\|]?\s*([^\n]{3,200})"])
 
-        sku = self.extract_field(
-            'sku',
-            [r'SKU\s*NO', r'SKU\b'],
-            [r'SKU\s*(?:NO|Number)?\s*[:\|]?\s*([A-Za-z0-9\-/]+)']
-        )
-        self.data['sku'] = sku
+        sku = self._get("(ii)SKUNO", "SKUNO", "SKU", tp=[r"SKU\s*(?:NO|Number)?\s*[:\|]?\s*([A-Za-z0-9][A-Za-z0-9\-/]{1,30})"])
+        if sku and re.fullmatch(r"(YES|NO|Y|N|NA)", sku, re.IGNORECASE):
+            sku = None
+        d["sku"] = sku
 
-        # ── COMPLIANCE / REFERENCE CODES ────────────────────────────────
-        self.data['iec_code'] = self.extract_field(
-            'iec_code',
-            [r'Import\s*Export\s*Code\s*\(IEC\)', r'Import\s*Export\s*Code', r'^IEC$'],
-            [
-                r'Import\s*Export\s*Code\s*\(?IEC\)?\s*[:\|]?\s*([A-Z0-9]{10})',
-                r'\bIEC\b\s*[:\|]?\s*([A-Z0-9]{10})',
-            ]
-        )
+        d["iec_code"] = self._get("ImportExportCode(IEC)", "re:importexportcode", tp=[r"Import\s*Export\s*Code\s*\(?IEC\)?\s*[:\|]?\s*([A-Z0-9]{10})"])
+        d["iec_branch_code"] = self._get("IECBranchCode", "IEC Branch Code", tp=[r"IEC\s*Branch\s*Code\s*[:\|]?\s*(\d+)"])
+        d["ad_code"] = self._get("ADCode", "AD Code", tp=[r"AD\s*Code\s*[:\|]?\s*(\d{5,10})"])
+        d["account_no"] = self._get("AccountNo", "Account No", tp=[r"Account\s*No\s*[:\|]?\s*(\d{8,18})"])
+        d["gstin"] = self._get("KYCID", "KYC ID", "GSTIN", tp=[r"KYC\s*ID\s*[:\|]?\s*([A-Z0-9]{15})", r"GSTIN\s*[:\|]?\s*([A-Z0-9]{15})"])
+        d["kyc_document"] = self._get("KYCDocument", "KYC Document", tp=[r"KYC\s*Document\s*[:\|]?\s*([^\n]{3,50})"])
+        d["state_code"] = self._get("StateCode", "State Code", tp=[r"State\s*Code\s*[:\|]?\s*(\d{1,2})"])
+        d["mhbs_no"] = self._get("MHBSNo", "MHBS No", tp=[r"MHBS\s*No\s*[:\|]?\s*([A-Z0-9\-]+)"])
 
-        self.data['iec_branch_code'] = self.extract_field(
-            'iec_branch_code',
-            [r'IEC\s*Branch\s*Code'],
-            [r'IEC\s*Branch\s*Code\s*[:\|]?\s*(\d+)']
-        )
+        egm = self._get("EGMNumber", "EGM Number", tp=[r"EGM\s*Number\s*[:\|]?\s*(\d{5,12})"])
+        if egm and not re.fullmatch(r"\d+", egm):
+            egm = self._text(r"EGM\s*Number\s*[:\|]?\s*(\d{5,12})")
+        d["egm_number"] = egm
 
-        self.data['ad_code'] = self.extract_field(
-            'ad_code',
-            [r'AD\s*Code'],
-            [r'AD\s*Code\s*[:\|]?\s*(\d{5,10})']
-        )
+        d["crn_number"] = d.get("hawb_number")
+        arr_all = self._text_all(r"\b(ARR-\d+)\b")
+        d["crn_mhbs_numbers"] = arr_all if arr_all else None
 
-        self.data['account_no'] = self.extract_field(
-            'account_no',
-            [r'Account\s*No'],
-            [r'Account\s*No\s*[:\|]?\s*(\d{8,18})']
-        )
+        d["status"] = self._get("Status", tp=[r"\bStatus\s*[:\|]?\s*(EXPCLOSED|EXPOPEN|[A-Z]{4,12})"])
+        d["under_meis_scheme"] = self._get("UnderMEISScheme", "Under MEIS Scheme", tp=[r"Under\s*MEIS\s*Scheme\s*[:\|]?\s*([A-Z]+)"])
+        d["nfei"] = self._get("NFEI", tp=[r"\bNFEI\s*[:\|]?\s*([A-Z]+)"])
+        d["government_nongovernment"] = self._get("GovernmentNonGovernment", "re:governmentnongovernment", tp=[r"(?:Government/Non-Government)\s*[:\|]?\s*(NON-GOVERNMENT|GOVERNMENT)"])
+        d["export_using_ecommerce"] = self._get("ExportUsinge-Commerce", "Export Using e-Commerce", tp=[r"Export\s*Using\s*e.Commerce\s*[:\|]?\s*([YN])"])
+        d["bond_or_ut"] = self._get("BONDORUT", "BOND OR UT", tp=[r"BOND\s*OR\s*UT\s*[:\|]?\s*([A-Z]+)"])
+        d["courier_name"] = self._get("CourierName", "Courier Name", tp=[r"Courier\s*Name\s*[:\|]?\s*([^\n]{3,80})"])
+        d["courier_reg_no"] = self._get("CourierRegistrationNumber", "re:courierregistrationnumber", tp=[r"Courier\s*Registration\s*Num[^\s:]*\s*[:\|]?\s*([A-Z0-9]+)"])
+        d["airline"] = self._get("Airlines", "Airline", tp=[r"Airlines?\s*[:\|]?\s*([A-Z][A-Z\s]+?)(?=\s+Flight|\s+Port|\n)"])
+        d["flight_number"] = self._get("FlightNumber", "Flight Number", tp=[r"Flight\s*Number\s*[:\|]?\s*([A-Z0-9\s]{2,12})"])
 
-        gstin = self.extract_field(
-            'gstin',
-            [r'KYC\s*ID', r'GSTIN', r'GST\s*No'],
-            [
-                r'KYC\s*ID\s*[:\|]?\s*([A-Z0-9]{15})',
-                r'GSTIN\s*[:\|]?\s*([A-Z0-9]{15})',
-                r'GST\s*No\.?\s*[:\|]?\s*([A-Z0-9]{15})',
-            ]
-        )
-        self.data['gstin'] = gstin
-
-        kyc_doc = self.extract_field(
-            'kyc_document',
-            [r'KYC\s*Document'],
-            [r'KYC\s*Document\s*[:\|]?\s*([^\n]{3,50})']
-        )
-        self.data['kyc_document'] = kyc_doc
-
-        self.data['state_code'] = self.extract_field(
-            'state_code',
-            [r'State\s*Code'],
-            [r'State\s*Code\s*[:\|]?\s*(\d{1,2})']
-        )
-
-        # ── REFERENCE NUMBERS ───────────────────────────────────────────
-        self.data['mhbs_no'] = self.extract_field(
-            'mhbs_no',
-            [r'MHBS\s*No'],
-            [r'MHBS\s*No\s*[:\|]?\s*([A-Z0-9\-]+)']
-        )
-
-        self.data['egm_number'] = self.extract_field(
-            'egm_number',
-            [r'EGM\s*Number'],
-            [r'EGM\s*Number\s*[:\|]?\s*([A-Z0-9\-/]+)']
-        )
-
-        # CRN Numbers (there can be multiple)
-        crn_numbers = self.find_all_in_text([r'\b(CRN[-\s]?\d{8,15})\b', r'\b(\d{11,15})\b'])
-        # Use the HAWB-style numbers that repeat as CRNs
-        hawb = self.data.get('hawb_number')
-        if hawb:
-            crn_matches = re.findall(
-                rf'\b{re.escape(hawb)}\b', self.full_text, re.IGNORECASE
-            )
-            if len(crn_matches) > 1:
-                # Extract MHBS Numbers paired with CRN
-                mhbs_list = re.findall(r'(ARR-\d+)', self.full_text)
-                unique_mhbs = list(dict.fromkeys(mhbs_list))  # dedup preserving order
-                self.data['crn_mhbs_numbers'] = unique_mhbs if unique_mhbs else None
-        self.data['crn_number'] = hawb  # CRN Number == HAWB Number in CSB-V
-
-        # ── STATUS ──────────────────────────────────────────────────────
-        self.data['status'] = self.extract_field(
-            'status',
-            [r'^Status$'],
-            [r'\bStatus\s*[:\|]?\s*([A-Z]+)']
-        )
-
-        # ── SCHEME / FLAGS ──────────────────────────────────────────────
-        scheme = self.extract_field(
-            'scheme',
-            [r'Under\s*MEIS\s*Scheme', r'Scheme'],
-            [r'Under\s*MEIS\s*Scheme\s*[:\|]?\s*([A-Z]+)']
-        )
-        if scheme:
-            if scheme.upper() in ('NO', 'N'):
-                scheme = 'NO'
-            elif scheme.upper() in ('YES', 'Y'):
-                scheme = 'YES'
-        self.data['under_meis_scheme'] = scheme
-
-        self.data['nfei'] = self.extract_field(
-            'nfei',
-            [r'NFEI'],
-            [r'\bNFEI\s*[:\|]?\s*([A-Z]+)']
-        )
-
-        govt = self.extract_field(
-            'government_nongovernment',
-            [r'Government.*Non.?Government', r'Govt.*Non.?Govt'],
-            [r'(?:Government/Non-Government)\s*[:\|]?\s*([A-Z\-]+)']
-        )
-        self.data['government_nongovernment'] = govt
-
-        ecommerce = self.extract_field(
-            'export_using_ecommerce',
-            [r'Export\s*Using\s*e.Commerce', r'e.Commerce'],
-            [r'Export\s*Using\s*e.Commerce\s*[:\|]?\s*([YN])']
-        )
-        self.data['export_using_ecommerce'] = ecommerce
-
-        bond_or_ut = self.extract_field(
-            'bond_or_ut',
-            [r'BOND\s*OR\s*UT'],
-            [r'BOND\s*OR\s*UT\s*[:\|]?\s*([A-Z]+)']
-        )
-        self.data['bond_or_ut'] = bond_or_ut
-
-        # ── COURIER DETAILS ─────────────────────────────────────────────
-        self.data['courier_name'] = self.extract_field(
-            'courier_name',
-            [r'Courier\s*Name'],
-            [r'Courier\s*Name\s*[:\|]?\s*([^\n]{3,80})']
-        )
-
-        self.data['courier_reg_no'] = self.extract_field(
-            'courier_reg_no',
-            [r'Courier\s*Registration\s*Num', r'Courier\s*Reg'],
-            [r'Courier\s*Registration\s*Num(?:ber)?\s*[:\|]?\s*([A-Z0-9]+)']
-        )
-
-        # ── TRANSPORT ───────────────────────────────────────────────────
-        self.data['airline'] = self.extract_field(
-            'airline',
-            [r'^Airlines?$'],
-            [r'Airlines?\s*[:\|]?\s*([^\n]{3,60})']
-        )
-
-        self.data['flight_number'] = self.extract_field(
-            'flight_number',
-            [r'Flight\s*Number'],
-            [r'Flight\s*Number\s*[:\|]?\s*([A-Z0-9\s]+)']
-        )
-
-        # Mode of transport (inferred)
         lower = self.full_text.lower()
-        if any(k in lower for k in ('flight', 'airline', 'airport', 'hawb')):
-            self.data['mode_of_transport'] = 'AIR'
-        elif any(k in lower for k in ('vessel', 'ship', 'sea', 'bl no', 'bill of lading')):
-            self.data['mode_of_transport'] = 'SEA'
-        else:
-            self.data['mode_of_transport'] = None
+        if any(k in lower for k in ("flight", "airline", "airport", "hawb")):
+            d["mode_of_transport"] = "AIR"
+        elif any(k in lower for k in ("vessel", "ship", "sea", "bill of lading")):
+            d["mode_of_transport"] = "SEA"
 
-        return self.data
+        return d
 
 
-# ---------------------------------------------------------------------------
-# FastAPI routes
-# ---------------------------------------------------------------------------
+def _parse_pdf_sync(pdf_bytes: bytes) -> Dict[str, Any]:
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        return ExtractionEngine(pdf).extract()
+
+
+async def _parse_pdf_async(pdf_bytes: bytes) -> Dict[str, Any]:
+    return await asyncio.to_thread(_parse_pdf_sync, pdf_bytes)
+
 
 @app.get("/")
 async def root():
-    return {
-        "service": "pdfduck API",
-        "version": "4.0.0",
-        "description": "Ultimate CSB-V / shipping-bill PDF extractor",
-        "fields_extracted": [
-            "shipping_bill_no (full CSBV number)",
-            "filling_date", "invoice_date", "date_of_departure",
-            "egm_date", "leo_date",
-            "invoice_number",
-            "hawb_number", "crn_number", "crn_mhbs_numbers", "mhbs_no", "egm_number",
-            "fob_value_inr", "fob_value_fc", "fob_currency", "fob_exchange_rate",
-            "invoice_value_inr", "unit_price", "unit_price_currency",
-            "total_item_value", "total_item_value_inr",
-            "total_taxable_value", "total_igst_paid", "total_cess_paid", "exchange_rate",
-            "exporter_name", "exporter_address",
-            "consignee_name", "consignee_address", "consignee_country",
-            "port_of_loading", "port_of_discharge", "custom_station",
-            "total_packages", "quantity", "unit_of_measure", "gross_weight",
-            "hs_code", "item_description", "sku",
-            "iec_code", "iec_branch_code", "ad_code", "account_no",
-            "gstin", "kyc_document", "state_code",
-            "status", "under_meis_scheme", "nfei",
-            "government_nongovernment", "export_using_ecommerce", "bond_or_ut",
-            "courier_name", "courier_reg_no",
-            "airline", "flight_number", "mode_of_transport",
-        ]
-    }
+    return {"service": "pdfduck API", "version": "5.0.0",
+            "endpoints": ["/extract", "/extract/batch", "/health"]}
 
 
 @app.get("/health")
@@ -738,38 +332,40 @@ async def health():
 
 
 @app.post("/extract")
-async def extract_pdf(file: UploadFile = File(...)):
-    """
-    Extract all fields from a CSB-V / shipping-bill PDF.
-    Returns one clean row per PDF with all available fields populated.
-    """
-    if not file.filename.lower().endswith('.pdf'):
-        raise HTTPException(status_code=400, detail="File must be a PDF")
-
+async def extract_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="File must be a PDF.")
+    pdf_bytes = await file.read()
+    if not pdf_bytes:
+        raise HTTPException(status_code=400, detail="Empty file.")
     try:
-        pdf_bytes = await file.read()
+        raw = await _parse_pdf_async(pdf_bytes)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Extraction failed: {exc}") from exc
+    data = {k: v for k, v in raw.items() if v is not None}
+    return JSONResponse({"success": True, "rows": 1, "data": [data]})
 
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            engine = ExtractionEngine(pdf)
-            data = engine.extract()
 
-        # Strip None values for clean CSV output
-        data = {k: v for k, v in data.items() if v is not None}
+@app.post("/extract/batch")
+async def extract_batch(files: List[UploadFile] = File(...)):
+    if len(files) > 50:
+        raise HTTPException(status_code=400, detail="Max 50 files per batch.")
 
-        return JSONResponse({
-            "success": True,
-            "method": "exhaustive_multi_column_extraction",
-            "rows": 1,
-            "data": [data]
-        })
+    async def _process(f: UploadFile) -> Dict[str, Any]:
+        if not f.filename.lower().endswith(".pdf"):
+            return {"file": f.filename, "error": "Not a PDF"}
+        pdf_bytes = await f.read()
+        try:
+            raw = await _parse_pdf_async(pdf_bytes)
+            return {"file": f.filename, "success": True,
+                    "data": {k: v for k, v in raw.items() if v is not None}}
+        except Exception as exc:
+            return {"file": f.filename, "success": False, "error": str(exc)}
 
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Extraction failed: {str(e)}"
-        )
+    results = await asyncio.gather(*[_process(f) for f in files])
+    return JSONResponse({"success": True, "rows": len(results), "data": list(results)})
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, workers=4)
